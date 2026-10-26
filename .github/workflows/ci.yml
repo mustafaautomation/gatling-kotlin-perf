@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: mvn -B verify
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shop-jar
+          path: target/shop.jar
+          retention-days: 3
+
+  load:
+    name: Smoke + load test (SLOs must hold)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/download-artifact@v8
+        with:
+          name: shop-jar
+          path: target
+      - run: scripts/start-app.sh
+      - name: Smoke
+        run: |
+          mvn -B test-compile gatling:test -Dgatling.simulationClass=simulations.SmokeSimulation | tee smoke.log
+          scripts/gatling-summary.sh smoke.log "Smoke"
+      - name: Load (20 new shoppers/s, 20 s ramp + 60 s hold)
+        run: |
+          mvn -B gatling:test -Dgatling.simulationClass=simulations.CheckoutLoadSimulation \
+            -DusersPerSec=20 -DrampSeconds=20 -DholdSeconds=60 | tee load.log
+          scripts/gatling-summary.sh load.log "Load"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gatling-reports
+          path: |
+            target/gatling/
+            app.log
+
+  load-negative:
+    name: Load test against a degraded build (SLOs must fail)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - uses: actions/download-artifact@v8
+        with:
+          name: shop-jar
+          path: target
+      - name: Start the shop with 400 ms extra checkout latency and every 20th checkout failing
+        run: scripts/start-app.sh
+        env:
+          SHOP_CHECKOUT_DELAY_MS: "400"
+          SHOP_FAIL_EVERY: "20"
+      - name: The SLO assertions must catch it
+        run: |
+          set +e
+          mvn -B test-compile gatling:test -Dgatling.simulationClass=simulations.CheckoutLoadSimulation \
+            -DusersPerSec=20 -DrampSeconds=10 -DholdSeconds=30 > load.log 2>&1
+          code=$?
+          set -e
+          scripts/gatling-summary.sh load.log "Degraded build"
+          if [ "$code" -eq 0 ]; then echo "::error::the load test passed against a degraded build"; exit 1; fi
+          grep -q "Gatling simulation assertions failed" load.log || { echo "::error::Gatling failed for a reason other than its assertions"; tail -50 load.log; exit 1; }
+          grep -q "95th percentile of response time is less than .* : false" load.log
+          grep -q "checkout: percentage of failed events is less than .* : false" load.log
+          echo "SLO assertions failed as expected"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gatling-reports-degraded
+          path: |
+            target/gatling/
+            load.log
